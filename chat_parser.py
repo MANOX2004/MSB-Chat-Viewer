@@ -19,9 +19,15 @@ _HYPHEN_MESSAGE = re.compile(
     rf"^(?P<date>\d{{1,4}}[./-]\d{{1,2}}[./-]\d{{2,4}}),?\s+"
     rf"(?P<time>{_TIME_PATTERN})\s+-\s+(?P<body>.*)$"
 )
+_MESSAGE_PREFIX_MARKS = re.compile(r"^[\s\ufeff\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
 _STICKER_OMITTED = re.compile(r"<\s*sticker\s+omitted\s*>", re.IGNORECASE)
+_ENCRYPTION_NOTICE = re.compile(
+    r"messages and calls are end-to-end encrypted",
+    re.IGNORECASE,
+)
 _ATTACHMENT_NAME = re.compile(
-    r"(?:<attached:\s*)?([^<>\\/\r\n]+\.(?:jpe?g|png|gif|webp|bmp))\b",
+    r"<attached:\s*(?P<attached>[^<>]*?\.(?:jpe?g|png|gif|webp|bmp))\s*>"
+    r"|(?<![\w./\\])(?P<plain>[^<>\\/\s]+\.(?:jpe?g|png|gif|webp|bmp))\b",
     re.IGNORECASE,
 )
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -118,6 +124,7 @@ def _parse_timestamp(date_text: str, time_text: str) -> datetime:
 
 
 def _message_start(line: str) -> tuple[datetime, str] | None:
+    line = _MESSAGE_PREFIX_MARKS.sub("", line)
     for pattern in (_BRACKET_MESSAGE, _HYPHEN_MESSAGE):
         match = pattern.match(line)
         if match is None:
@@ -146,11 +153,28 @@ def _image_for_text(
     text: str, images: dict[str, tuple[str, bytes]]
 ) -> tuple[str | None, bytes | None]:
     for match in _ATTACHMENT_NAME.finditer(text):
-        filename = match.group(1).strip()
+        filename = (match.group("attached") or match.group("plain")).strip()
         image = images.get(Path(filename).name.casefold())
         if image is not None:
             return image
     return None, None
+
+
+def _strip_attachment_reference(text: str, attachment_name: str) -> str:
+    escaped_name = re.escape(attachment_name)
+    text = re.sub(
+        rf"<\s*attached:\s*{escaped_name}\s*>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"(?<![\w./\\]){escaped_name}(?:\s*\(file attached\))?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text.strip()
 
 
 def _parse_lines(text: str, images: dict[str, tuple[str, bytes]]) -> list[ChatMessage]:
@@ -163,7 +187,11 @@ def _parse_lines(text: str, images: dict[str, tuple[str, bytes]]) -> list[ChatMe
             return
         body = _clean_sticker_text("\n".join(current_body).strip())
         sender, message_text = _split_sender(body)
+        if _ENCRYPTION_NOTICE.search(message_text):
+            sender = None
         attachment_name, image_data = _image_for_text(message_text, images)
+        if attachment_name is not None:
+            message_text = _strip_attachment_reference(message_text, attachment_name)
         messages.append(
             ChatMessage(
                 timestamp=current_timestamp,
